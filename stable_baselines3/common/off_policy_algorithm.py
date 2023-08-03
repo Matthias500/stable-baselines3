@@ -20,6 +20,8 @@ from stable_baselines3.common.utils import safe_mean, should_collect_more_steps
 from stable_baselines3.common.vec_env import VecEnv
 from stable_baselines3.her.her_replay_buffer import HerReplayBuffer
 
+from pearl.task_buffer import TaskBuffer
+
 
 class OffPolicyAlgorithm(BaseAlgorithm):
     """
@@ -70,6 +72,7 @@ class OffPolicyAlgorithm(BaseAlgorithm):
         during the warm up phase (before learning starts)
     :param sde_support: Whether the model support gSDE or not
     :param supported_action_spaces: The action spaces supported by the algorithm.
+    :param use_pearl: use Pearl
     """
 
     def __init__(
@@ -102,6 +105,7 @@ class OffPolicyAlgorithm(BaseAlgorithm):
         use_sde_at_warmup: bool = False,
         sde_support: bool = True,
         supported_action_spaces: Optional[Tuple[gym.spaces.Space, ...]] = None,
+        use_pearl: bool = False
     ):
 
         super(OffPolicyAlgorithm, self).__init__(
@@ -145,6 +149,7 @@ class OffPolicyAlgorithm(BaseAlgorithm):
             self.policy_kwargs["use_sde"] = self.use_sde
         # For gSDE only
         self.use_sde_at_warmup = use_sde_at_warmup
+        self.use_pearl = use_pearl
 
     def _convert_train_freq(self) -> None:
         """
@@ -199,6 +204,19 @@ class OffPolicyAlgorithm(BaseAlgorithm):
                 self.buffer_size,
                 device=self.device,
                 replay_buffer=replay_buffer,
+                **self.replay_buffer_kwargs,
+            )
+
+        elif self.use_pearl:
+            assert isinstance(self.observation_space, gym.spaces.Dict)
+            self.replay_buffer = TaskBuffer(
+                nr_tasks=self.nr_tasks,
+                total_buffer_size=self.buffer_size,
+                observation_space=self.observation_space,
+                action_space=self.action_space,
+                device=self.device,
+                n_envs=self.n_envs,
+                optimize_memory_usage=self.optimize_memory_usage,
                 **self.replay_buffer_kwargs,
             )
 
