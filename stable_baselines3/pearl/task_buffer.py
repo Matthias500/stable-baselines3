@@ -20,20 +20,20 @@ try:
     import psutil
 except ImportError:
     psutil = None
-from common.buffers import ReplayBuffer
+from stable_baselines3.common.buffers import ReplayBuffer
 
 
 class TaskBuffer(ABC):
 
     def __init__(self,
-                 nr_tasks: int = 1,
-                 total_buffer_size: int,
-                 observation_space: spaces.Space,
-                 action_space: spaces.Space,
-                 device: Union[th.device, str] = "cpu",
-                 n_envs: int = 1,
-                 optimize_memory_usage: bool = False,
-                 handle_timeout_termination: bool = True,
+         total_buffer_size: int,
+         observation_space: spaces.Space,
+         action_space: spaces.Space,
+         device: Union[th.device, str] = "cpu",
+         n_envs: int = 1,
+         optimize_memory_usage: bool = False,
+         handle_timeout_termination: bool = True,
+         nr_tasks: int = 1,
     ):
         super(TaskBuffer, self).__init__()
         self.total_buffer_size = total_buffer_size

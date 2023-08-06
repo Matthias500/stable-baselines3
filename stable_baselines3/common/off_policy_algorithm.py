@@ -20,7 +20,7 @@ from stable_baselines3.common.utils import safe_mean, should_collect_more_steps
 from stable_baselines3.common.vec_env import VecEnv
 from stable_baselines3.her.her_replay_buffer import HerReplayBuffer
 
-from pearl.task_buffer import TaskBuffer
+from stable_baselines3.pearl.task_buffer import TaskBuffer
 
 
 class OffPolicyAlgorithm(BaseAlgorithm):
@@ -105,7 +105,9 @@ class OffPolicyAlgorithm(BaseAlgorithm):
         use_sde_at_warmup: bool = False,
         sde_support: bool = True,
         supported_action_spaces: Optional[Tuple[gym.spaces.Space, ...]] = None,
-        use_pearl: bool = False
+        use_pearl: bool = False,
+        nr_tasks: int = 1,
+        tasks: Optional[List[Dict[str, Any]]] = None,
     ):
 
         super(OffPolicyAlgorithm, self).__init__(
@@ -149,7 +151,14 @@ class OffPolicyAlgorithm(BaseAlgorithm):
             self.policy_kwargs["use_sde"] = self.use_sde
         # For gSDE only
         self.use_sde_at_warmup = use_sde_at_warmup
+
+        # Pearl
         self.use_pearl = use_pearl
+        self.nr_tasks = nr_tasks
+        assert not(isinstance(tasks, type(None)) and nr_tasks > 1), 'No Tasks specified!'
+        if self.nr_tasks > 1:
+            assert len(tasks) == nr_tasks, 'Missmatch between Task List and Number of Tasks specified'
+            self.tasks = tasks
 
     def _convert_train_freq(self) -> None:
         """
@@ -178,7 +187,7 @@ class OffPolicyAlgorithm(BaseAlgorithm):
         self.set_random_seed(self.seed)
 
         # Use DictReplayBuffer if needed
-        if self.replay_buffer_class is None:
+        if self.replay_buffer_class is None and not self.use_pearl:
             if isinstance(self.observation_space, gym.spaces.Dict):
                 self.replay_buffer_class = DictReplayBuffer
             else:
@@ -208,9 +217,7 @@ class OffPolicyAlgorithm(BaseAlgorithm):
             )
 
         elif self.use_pearl:
-            assert isinstance(self.observation_space, gym.spaces.Dict)
             self.replay_buffer = TaskBuffer(
-                nr_tasks=self.nr_tasks,
                 total_buffer_size=self.buffer_size,
                 observation_space=self.observation_space,
                 action_space=self.action_space,
@@ -218,6 +225,7 @@ class OffPolicyAlgorithm(BaseAlgorithm):
                 n_envs=self.n_envs,
                 optimize_memory_usage=self.optimize_memory_usage,
                 **self.replay_buffer_kwargs,
+                nr_tasks=self.nr_tasks,
             )
 
         if self.replay_buffer is None:
@@ -361,27 +369,67 @@ class OffPolicyAlgorithm(BaseAlgorithm):
 
         callback.on_training_start(locals(), globals())
 
-        while self.num_timesteps < total_timesteps:
-            rollout = self.collect_rollouts(
-                self.env,
-                train_freq=self.train_freq,
-                action_noise=self.action_noise,
-                callback=callback,
-                learning_starts=self.learning_starts,
-                replay_buffer=self.replay_buffer,
-                log_interval=log_interval,
-            )
+        if self.use_pearl:
+            curr_task = 0
+            while self.num_timesteps < total_timesteps:
+                if (curr_task) >= self.nr_tasks:
+                    curr_task = 0
 
-            if rollout.continue_training is False:
-                break
+                if self.replay_buffer.buffers[curr_task].pos < self.learning_starts:
+                    learning_starts = self.num_timesteps + self.learning_starts
+                else:
+                    learning_starts = self.learning_starts
 
-            if self.num_timesteps > 0 and self.num_timesteps > self.learning_starts:
-                # If no `gradient_steps` is specified,
-                # do as many gradients steps as steps performed during the rollout
-                gradient_steps = self.gradient_steps if self.gradient_steps >= 0 else rollout.episode_timesteps
-                # Special case when the user passes `gradient_steps=0`
-                if gradient_steps > 0:
-                    self.train(batch_size=self.batch_size, gradient_steps=gradient_steps)
+                #set env parameters to curr_tasks parameter set
+                params = list(self.tasks[curr_task].items())
+                for j in range(len(params)):
+                    self.env.set_attr(params[j][0], params[j][1])
+
+                rollout = self.collect_rollouts(
+                    self.env,
+                    train_freq=self.train_freq,
+                    action_noise=self.action_noise,
+                    callback=callback,
+                    learning_starts=learning_starts,
+                    replay_buffer=self.replay_buffer.buffers[curr_task],
+                    log_interval=log_interval,
+                )
+
+                if rollout.continue_training is False:
+                    break
+
+                if self.num_timesteps > 0 and self.num_timesteps > self.learning_starts:
+                    # If no `gradient_steps` is specified,
+                    # do as many gradients steps as steps performed during the rollout
+                    gradient_steps = self.gradient_steps if self.gradient_steps >= 0 else rollout.episode_timesteps
+                    # Special case when the user passes `gradient_steps=0`
+                    if gradient_steps > 0:
+                        self.train(batch_size=self.batch_size, gradient_steps=gradient_steps, curr_task = curr_task)
+
+                curr_task = curr_task + 1
+
+        else:
+            while self.num_timesteps < total_timesteps:
+                rollout = self.collect_rollouts(
+                    self.env,
+                    train_freq=self.train_freq,
+                    action_noise=self.action_noise,
+                    callback=callback,
+                    learning_starts=self.learning_starts,
+                    replay_buffer=self.replay_buffer,
+                    log_interval=log_interval,
+                )
+
+                if rollout.continue_training is False:
+                    break
+
+                if self.num_timesteps > 0 and self.num_timesteps > self.learning_starts:
+                    # If no `gradient_steps` is specified,
+                    # do as many gradients steps as steps performed during the rollout
+                    gradient_steps = self.gradient_steps if self.gradient_steps >= 0 else rollout.episode_timesteps
+                    # Special case when the user passes `gradient_steps=0`
+                    if gradient_steps > 0:
+                        self.train(batch_size=self.batch_size, gradient_steps=gradient_steps)
 
         callback.on_training_end()
 

@@ -70,6 +70,7 @@ class SAC(OffPolicyAlgorithm):
     :param device: Device (cpu, cuda, ...) on which the code should be run.
         Setting it to auto, the code will be run on the GPU if possible.
     :param _init_setup_model: Whether or not to build the network at the creation of the instance
+    :param use_pearl: use Pearl
     """
 
     def __init__(
@@ -101,6 +102,9 @@ class SAC(OffPolicyAlgorithm):
         seed: Optional[int] = None,
         device: Union[th.device, str] = "auto",
         _init_setup_model: bool = True,
+        use_pearl: bool = False,
+        nr_tasks: int = 1,
+        tasks: Optional[Dict[str, Any]] = None,
     ):
 
         super(SAC, self).__init__(
@@ -130,6 +134,9 @@ class SAC(OffPolicyAlgorithm):
             optimize_memory_usage=optimize_memory_usage,
             supported_action_spaces=(gym.spaces.Box),
             support_multi_env=True,
+            use_pearl=use_pearl,
+            nr_tasks=nr_tasks,
+            tasks=tasks,
         )
 
         self.target_entropy = target_entropy
@@ -180,7 +187,7 @@ class SAC(OffPolicyAlgorithm):
         self.critic = self.policy.critic
         self.critic_target = self.policy.critic_target
 
-    def train(self, gradient_steps: int, batch_size: int = 64) -> None:
+    def train(self, gradient_steps: int, batch_size: int = 64, curr_task: int = 0) -> None:
         # Switch to train mode (this affects batch norm / dropout)
         self.policy.set_training_mode(True)
         # Update optimizers learning rate
@@ -196,7 +203,10 @@ class SAC(OffPolicyAlgorithm):
 
         for gradient_step in range(gradient_steps):
             # Sample replay buffer
-            replay_data = self.replay_buffer.sample(batch_size, env=self._vec_normalize_env)
+            if self.use_pearl:
+                replay_data = self.replay_buffer.buffers[curr_task].sample(batch_size, env=self._vec_normalize_env)
+            else:
+                replay_data = self.replay_buffer.sample(batch_size, env=self._vec_normalize_env)
 
             # We need to sample because `log_std` may have changed between two gradient steps
             if self.use_sde:
