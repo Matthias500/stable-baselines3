@@ -6,6 +6,7 @@ from copy import deepcopy
 from typing import Any, Dict, List, Optional, Tuple, Type, Union
 
 import gym
+from gym import spaces
 import numpy as np
 import torch as th
 
@@ -106,8 +107,9 @@ class OffPolicyAlgorithm(BaseAlgorithm):
         sde_support: bool = True,
         supported_action_spaces: Optional[Tuple[gym.spaces.Space, ...]] = None,
         use_pearl: bool = False,
-        nr_tasks: int = 1,
+        nr_tasks: int = 0,
         tasks: Optional[List[Dict[str, Any]]] = None,
+        z_dim: int = 1
     ):
 
         super(OffPolicyAlgorithm, self).__init__(
@@ -155,10 +157,13 @@ class OffPolicyAlgorithm(BaseAlgorithm):
         # Pearl
         self.use_pearl = use_pearl
         self.nr_tasks = nr_tasks
-        assert not(isinstance(tasks, type(None)) and nr_tasks > 1), 'No Tasks specified!'
-        if self.nr_tasks > 1:
-            assert len(tasks) == nr_tasks, 'Missmatch between Task List and Number of Tasks specified'
+        #assert not(isinstance(tasks, type(None)) and nr_tasks >= 1), 'No Tasks specified!'
+        if self.nr_tasks >= 1:
+            #assert len(tasks) == nr_tasks, 'Missmatch between Task List and Number of Tasks specified'
             self.tasks = tasks
+
+        self.z_dim = z_dim
+        self.meta_batch_size = z_dim
 
     def _convert_train_freq(self) -> None:
         """
@@ -239,8 +244,19 @@ class OffPolicyAlgorithm(BaseAlgorithm):
                 **self.replay_buffer_kwargs,
             )
 
+        if self.use_pearl:
+            z_ub = np.full((self.z_dim,), np.inf)
+            z_lb = np.full((self.z_dim,), -np.inf)
+            new_ub = np.concatenate((self.observation_space.high, z_ub))
+            new_lb = np.concatenate((self.observation_space.low, z_lb))
+            new_shape = (self.observation_space.shape[0] + self.z_dim,)
+            self.policy_obs_space = spaces.Box(low=new_lb, high=new_ub, shape=new_shape, dtype=np.single)
+
+        else:
+            self.policy_obs_space = self.observation_space
+
         self.policy = self.policy_class(  # pytype:disable=not-instantiable
-            self.observation_space,
+            self.policy_obs_space,
             self.action_space,
             self.lr_schedule,
             **self.policy_kwargs,  # pytype:disable=not-instantiable
@@ -370,30 +386,27 @@ class OffPolicyAlgorithm(BaseAlgorithm):
         callback.on_training_start(locals(), globals())
 
         if self.use_pearl:
-            curr_task = 0
             while self.num_timesteps < total_timesteps:
-                if (curr_task) >= self.nr_tasks:
-                    curr_task = 0
+                for curr_task in range(self.nr_tasks):
+                    if self.replay_buffer.buffers[curr_task].pos < self.learning_starts and self.replay_buffer.buffers[curr_task].full == False:
+                        learning_starts = self.num_timesteps + self.learning_starts
+                    else:
+                        learning_starts = self.learning_starts
 
-                if self.replay_buffer.buffers[curr_task].pos < self.learning_starts:
-                    learning_starts = self.num_timesteps + self.learning_starts
-                else:
-                    learning_starts = self.learning_starts
+                    #set env parameters to curr_tasks parameter set
+                    params = list(self.tasks[curr_task].items())
+                    for j in range(len(params)):
+                        self.env.set_attr(params[j][0], params[j][1])
 
-                #set env parameters to curr_tasks parameter set
-                params = list(self.tasks[curr_task].items())
-                for j in range(len(params)):
-                    self.env.set_attr(params[j][0], params[j][1])
-
-                rollout = self.collect_rollouts(
-                    self.env,
-                    train_freq=self.train_freq,
-                    action_noise=self.action_noise,
-                    callback=callback,
-                    learning_starts=learning_starts,
-                    replay_buffer=self.replay_buffer.buffers[curr_task],
-                    log_interval=log_interval,
-                )
+                    rollout = self.collect_rollouts(
+                        self.env,
+                        train_freq=self.train_freq,
+                        action_noise=self.action_noise,
+                        callback=callback,
+                        learning_starts=learning_starts,
+                        replay_buffer=self.replay_buffer.buffers[curr_task],
+                        log_interval=log_interval,
+                    )
 
                 if rollout.continue_training is False:
                     break
@@ -404,9 +417,7 @@ class OffPolicyAlgorithm(BaseAlgorithm):
                     gradient_steps = self.gradient_steps if self.gradient_steps >= 0 else rollout.episode_timesteps
                     # Special case when the user passes `gradient_steps=0`
                     if gradient_steps > 0:
-                        self.train(batch_size=self.batch_size, gradient_steps=gradient_steps, curr_task = curr_task)
-
-                curr_task = curr_task + 1
+                        self.train(batch_size=self.batch_size, gradient_steps=gradient_steps)
 
         else:
             while self.num_timesteps < total_timesteps:
@@ -447,6 +458,7 @@ class OffPolicyAlgorithm(BaseAlgorithm):
         learning_starts: int,
         action_noise: Optional[ActionNoise] = None,
         n_envs: int = 1,
+        z: Optional[np.ndarray] = None,
     ) -> Tuple[np.ndarray, np.ndarray]:
         """
         Sample an action according to the exploration policy.
@@ -471,7 +483,11 @@ class OffPolicyAlgorithm(BaseAlgorithm):
             # Note: when using continuous actions,
             # we assume that the policy uses tanh to scale the action
             # We use non-deterministic action in the case of SAC, for TD3, it does not matter
-            unscaled_action, _ = self.predict(self._last_obs, deterministic=False)
+            if self.use_pearl:
+                pearl_last_obs = np.concatenate((self._last_obs,z),axis=1)
+                unscaled_action, _ = self.predict(pearl_last_obs, deterministic=False)
+            else:
+                unscaled_action, _ = self.predict(self._last_obs, deterministic=False)
 
         # Rescale the action from [low, high] to [-1, 1]
         if isinstance(self.action_space, gym.spaces.Box):
@@ -639,8 +655,15 @@ class OffPolicyAlgorithm(BaseAlgorithm):
                 # Sample a new noise matrix
                 self.actor.reset_noise(env.num_envs)
 
+            #Sample context
+
+            # Compute latent vector
+            # Dummy:
+            z = np.zeros((self.z_dim,))
+            z_stack = np.tile(z, (self.env.num_envs, 1))
+
             # Select action randomly or according to policy
-            actions, buffer_actions = self._sample_action(learning_starts, action_noise, env.num_envs)
+            actions, buffer_actions = self._sample_action(learning_starts, action_noise, env.num_envs, z=z_stack)
 
             # Rescale and perform action
             new_obs, rewards, dones, infos = env.step(actions)
@@ -685,3 +708,6 @@ class OffPolicyAlgorithm(BaseAlgorithm):
         callback.on_rollout_end()
 
         return RolloutReturn(num_collected_steps * env.num_envs, num_collected_episodes, continue_training)
+
+    def print_last_obs(self) -> None:
+        print(self._last_obs)
