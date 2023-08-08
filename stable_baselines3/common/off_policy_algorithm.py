@@ -16,12 +16,13 @@ from stable_baselines3.common.callbacks import BaseCallback
 from stable_baselines3.common.noise import ActionNoise, VectorizedActionNoise
 from stable_baselines3.common.policies import BasePolicy
 from stable_baselines3.common.save_util import load_from_pkl, save_to_pkl
-from stable_baselines3.common.type_aliases import GymEnv, MaybeCallback, RolloutReturn, Schedule, TrainFreq, TrainFrequencyUnit
+from stable_baselines3.common.type_aliases import GymEnv, MaybeCallback, RolloutReturn, Schedule, TrainFreq, TrainFrequencyUnit, ReplayBufferSamples
 from stable_baselines3.common.utils import safe_mean, should_collect_more_steps
 from stable_baselines3.common.vec_env import VecEnv
 from stable_baselines3.her.her_replay_buffer import HerReplayBuffer
 
 from stable_baselines3.pearl.task_buffer import TaskBuffer
+from stable_baselines3.pearl.pearl_agent import PEARLAgent
 
 
 class OffPolicyAlgorithm(BaseAlgorithm):
@@ -109,7 +110,11 @@ class OffPolicyAlgorithm(BaseAlgorithm):
         use_pearl: bool = False,
         nr_tasks: int = 0,
         tasks: Optional[List[Dict[str, Any]]] = None,
-        z_dim: int = 1
+        z_dim: int = 1,
+        meta_batch_size: int = 64,
+        history: int = 100,
+        encoder_net_arch: List[int] = [200,200,200],
+        encoder_lr: float = 0.0003,
     ):
 
         super(OffPolicyAlgorithm, self).__init__(
@@ -163,7 +168,10 @@ class OffPolicyAlgorithm(BaseAlgorithm):
             self.tasks = tasks
 
         self.z_dim = z_dim
-        self.meta_batch_size = z_dim
+        self.meta_batch_size = meta_batch_size
+        self.history = history #number of rescently collected samples from which S_c is allowed to Sample
+        self.encoder_lr = encoder_lr
+        self.encoder_net_arch = encoder_net_arch
 
     def _convert_train_freq(self) -> None:
         """
@@ -251,7 +259,6 @@ class OffPolicyAlgorithm(BaseAlgorithm):
             new_lb = np.concatenate((self.observation_space.low, z_lb))
             new_shape = (self.observation_space.shape[0] + self.z_dim,)
             self.policy_obs_space = spaces.Box(low=new_lb, high=new_ub, shape=new_shape, dtype=np.single)
-
         else:
             self.policy_obs_space = self.observation_space
 
@@ -262,6 +269,13 @@ class OffPolicyAlgorithm(BaseAlgorithm):
             **self.policy_kwargs,  # pytype:disable=not-instantiable
         )
         self.policy = self.policy.to(self.device)
+
+        if self.use_pearl:
+            self.agent = PEARLAgent(
+                observation_space=self.observation_space,
+                action_space=self.action_space,
+                latent_dim=self.z_dim
+            )
 
         # Convert train freq parameter to TrainFreq object
         self._convert_train_freq()
@@ -406,6 +420,7 @@ class OffPolicyAlgorithm(BaseAlgorithm):
                         learning_starts=learning_starts,
                         replay_buffer=self.replay_buffer.buffers[curr_task],
                         log_interval=log_interval,
+                        curr_task=curr_task,
                     )
 
                 if rollout.continue_training is False:
@@ -609,6 +624,7 @@ class OffPolicyAlgorithm(BaseAlgorithm):
         action_noise: Optional[ActionNoise] = None,
         learning_starts: int = 0,
         log_interval: Optional[int] = None,
+        curr_task: Optional[int] = None,
     ) -> RolloutReturn:
         """
         Collect experiences and store them into a ``ReplayBuffer``.
@@ -655,12 +671,15 @@ class OffPolicyAlgorithm(BaseAlgorithm):
                 # Sample a new noise matrix
                 self.actor.reset_noise(env.num_envs)
 
-            #Sample context
-
             # Compute latent vector
-            # Dummy:
-            z = np.zeros((self.z_dim,))
-            z_stack = np.tile(z, (self.env.num_envs, 1))
+            if self.replay_buffer.buffers[curr_task].pos < self.history and self.replay_buffer.buffers[curr_task].full == False:
+                self.agent.clear_z()
+            else:
+                context = self.replay_buffer.buffers[curr_task].sample_context(self.meta_batch_size, self.history)
+                self.agent(context.float())
+            #print(self.agent(context.float()).size())
+            #z = np.zeros((self.z_dim,))
+            z_stack = np.tile(self.agent.z[0].detach().cpu().numpy(), (self.env.num_envs, 1))
 
             # Select action randomly or according to policy
             actions, buffer_actions = self._sample_action(learning_starts, action_noise, env.num_envs, z=z_stack)
@@ -711,3 +730,4 @@ class OffPolicyAlgorithm(BaseAlgorithm):
 
     def print_last_obs(self) -> None:
         print(self._last_obs)
+

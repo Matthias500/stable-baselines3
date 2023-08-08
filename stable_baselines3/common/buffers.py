@@ -304,6 +304,24 @@ class ReplayBuffer(BaseBuffer):
         )
         return ReplayBufferSamples(*tuple(map(self.to_torch, data)))
 
+    def sample_context(self, meta_batch_size: int = 64, history: int = 100, env: Optional[VecNormalize] = None) -> ReplayBufferSamples:
+        #if not enough data is available -> all zeros sample
+        if self.pos < history and not(self.full):
+            data = (
+                np.zeros((meta_batch_size, self.obs_shape[0])),
+                np.zeros((meta_batch_size, self.action_dim)),
+                np.zeros((meta_batch_size, self.obs_shape[0])),
+                np.zeros((meta_batch_size, 1)),
+                np.zeros((meta_batch_size, 1)),
+            )
+            context = ReplayBufferSamples(*tuple(map(self.to_torch, data)))
+        else:
+            batch_inds = np.ones((meta_batch_size), dtype=int) * self.pos - np.random.randint(0, high=history, size=meta_batch_size)
+            context = self._get_samples(batch_inds, env=env)
+
+        return th.cat((context.observations, context.actions, context.next_observations, context.rewards),1)
+
+
 
 class RolloutBuffer(BaseBuffer):
     """

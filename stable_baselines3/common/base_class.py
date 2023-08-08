@@ -339,7 +339,7 @@ class BaseAlgorithm(ABC):
             List of Torch variables whose state dicts to save (e.g. th.nn.Modules),
             and list of other Torch variables to store with ``th.save``.
         """
-        state_dicts = ["policy"]
+        state_dicts = ["policy", "agent"]
 
         return state_dicts, []
 

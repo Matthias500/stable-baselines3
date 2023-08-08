@@ -106,6 +106,11 @@ class SAC(OffPolicyAlgorithm):
         nr_tasks: int = 1,
         tasks: Optional[Dict[str, Any]] = None,
         z_dim: int = 1,
+        meta_batch_size: int = 64,
+        history: int = 100,
+        encoder_net_arch: List[int] = [200, 200, 200],
+        encoder_lr: float = 0.003,
+        kl_lambda: float = 1.
     ):
 
         super(SAC, self).__init__(
@@ -138,7 +143,11 @@ class SAC(OffPolicyAlgorithm):
             use_pearl=use_pearl,
             nr_tasks=nr_tasks,
             tasks=tasks,
-            z_dim =z_dim,
+            z_dim=z_dim,
+            meta_batch_size=meta_batch_size,
+            history=history,
+            encoder_net_arch=encoder_net_arch,
+            encoder_lr=encoder_lr,
         )
 
         self.target_entropy = target_entropy
@@ -148,6 +157,7 @@ class SAC(OffPolicyAlgorithm):
         self.ent_coef = ent_coef
         self.target_update_interval = target_update_interval
         self.ent_coef_optimizer = None
+        self.kl_lambda = kl_lambda
 
         if _init_setup_model:
             self._setup_model()
@@ -201,7 +211,7 @@ class SAC(OffPolicyAlgorithm):
         self._update_learning_rate(optimizers)
 
         ent_coef_losses, ent_coefs = [], []
-        actor_losses, critic_losses = [], []
+        actor_losses, critic_losses, kl_losses, encoder_losses = [], [], [], []
 
         for gradient_step in range(gradient_steps):
             for task in range(self.nr_tasks):
@@ -210,18 +220,22 @@ class SAC(OffPolicyAlgorithm):
                     #sample RL batch
                     replay_data = self.replay_buffer.buffers[task].sample(batch_size, env=self._vec_normalize_env)
 
-                    #Sample context Batch
-
-
-                    #Compute latent vector
-                    #Dummy:
-                    z = np.zeros((self.z_dim, ))
-                    z_stack = np.tile(z, (batch_size,1))
-                    z_stack = th.as_tensor(z_stack).to(self.device)
+                    # Compute latent vector
+                    if self.replay_buffer.buffers[task].pos < self.history and self.replay_buffer.buffers[
+                       task].full == False:
+                        self.agent.clear_z()
+                    else:
+                        context = self.replay_buffer.buffers[task].sample_context(self.meta_batch_size,
+                                                                                       self.history)
+                        self.agent(context.float())
+                    #z = np.zeros((self.z_dim, ))
+                    #z_stack = np.tile(z, (batch_size,1))
+                    #z_stack = th.as_tensor(z_stack).to(self.device)
+                    z_stack = self.agent.z.tile((batch_size,1))
                     #Add latent to observation and next_observation
-                    pearl_observations = th.cat((replay_data.observations, z_stack), 1)
-                    pearl_observations_detached = th.cat((replay_data.observations, z_stack.detach()), 1)
-                    pearl_next_observations = th.cat((replay_data.next_observations, z_stack.detach()), 1)
+                    pearl_observations = th.cat((replay_data.observations, self.agent.z.tile((batch_size,1))), 1)
+                    pearl_observations_detached = th.cat((replay_data.observations, self.agent.z.tile((batch_size,1)).detach()), 1)
+                    pearl_next_observations = th.cat((replay_data.next_observations, self.agent.z.tile((batch_size,1)).detach()), 1)
 
                 else:
                     replay_data = self.replay_buffer.sample(batch_size, env=self._vec_normalize_env)
@@ -250,6 +264,12 @@ class SAC(OffPolicyAlgorithm):
                         sum_ent_coef_loss.add(ent_coef_loss)
                 else:
                     ent_coef = self.ent_coef_tensor
+
+                kl_loss = self.kl_lambda * self.agent.compute_kl_div()
+                if task == 0:
+                    sum_kl_loss = kl_loss
+                else:
+                    sum_kl_loss.add(kl_loss)
 
                 with th.no_grad():
                     # Select action according to policy
@@ -303,23 +323,32 @@ class SAC(OffPolicyAlgorithm):
                 self.ent_coef_optimizer.step()
                 ent_coefs.append(sum_ent_coef_loss.item())
 
+            context_encoder_loss = sum_critic_loss + sum_kl_loss
+            self.agent.context_optimizer.zero_grad()
+            context_encoder_loss.backward(retain_graph=True)
+            self.agent.context_optimizer.step()
+
             # Optimize the critic
             self.critic.optimizer.zero_grad()
-            sum_critic_loss.backward()
+            sum_critic_loss.backward(retain_graph=True)
             self.critic.optimizer.step()
 
             # Optimize the actor
             self.actor.optimizer.zero_grad()
-            sum_actor_loss.backward()
+            sum_actor_loss.backward(retain_graph=True)
             self.actor.optimizer.step()
 
             #Track Losses
             critic_losses.append(sum_critic_loss.item())
             actor_losses.append(sum_actor_loss.item())
+            kl_losses.append(sum_kl_loss.item())
+            encoder_losses.append(context_encoder_loss.item())
 
             # Update target networks
             if gradient_step % self.target_update_interval == 0:
                 polyak_update(self.critic.parameters(), self.critic_target.parameters(), self.tau)
+
+        self.agent.detach_z()
 
         self._n_updates += gradient_steps
 
@@ -327,6 +356,8 @@ class SAC(OffPolicyAlgorithm):
         self.logger.record("train/ent_coef", np.mean(ent_coefs))
         self.logger.record("train/actor_loss", np.mean(actor_losses))
         self.logger.record("train/critic_loss", np.mean(critic_losses))
+        self.logger.record("train/kl_loss", np.mean(kl_losses))
+        self.logger.record("train/encoder_loss", np.mean(encoder_losses))
         if len(ent_coef_losses) > 0:
             self.logger.record("train/ent_coef_loss", np.mean(ent_coef_losses))
 
