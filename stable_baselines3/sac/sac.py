@@ -246,7 +246,7 @@ class SAC(OffPolicyAlgorithm):
 
                 # Action by the current actor for the sampled state
                 if self.use_pearl:
-                    actions_pi, log_prob = self.actor.action_log_prob(pearl_observations)
+                    actions_pi, log_prob = self.actor.action_log_prob(pearl_observations_detached)
                 else:
                     actions_pi, log_prob = self.actor.action_log_prob(replay_data.observations)
                 log_prob = log_prob.reshape(-1, 1)
